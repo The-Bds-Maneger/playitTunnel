@@ -3,8 +3,20 @@ import { httpRequest } from "@the-bds-maneger/core-utils";
 import { format } from "node:util";
 import { EventEmitter } from "node:events";
 import crypto from "node:crypto";
-// import dgram from "node:dgram";
-// import net from "node:net";
+import dgram from "node:dgram";
+
+export function parseIp(ip: string): {ip: string, port?: number, type: "ipv4"|"ipv6"} {
+  const ipv4Regex = /^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})(:([0-9]+))?$/;
+  const [, ip4,, port] = ip.match(ipv4Regex)||[];
+  if (ip4) return {type: "ipv4", ip: ip4, ...(port?{port: parseInt(port)}:{})};
+  // IPv6
+  const delimeters = /\[([0-9a-zA-Z:]+)\](:([0-9]+))/
+  if (delimeters.test(ip)) {
+    const [, ip6,, port] = ip.match(delimeters)||[];
+    return {type: "ipv6", ip: ip6, ...(port?{port: parseInt(port)}:{})};
+  }
+  return {type: "ipv6", ip};
+}
 
 export type agentSecret = {type: "agent-secret", secret_key: string};
 export type tunnelType = "minecraft-java"|"minecraft-bedrock"|"valheim"|"terraria"|"starbound"|"rust"|"7days"|"unturned";
@@ -73,6 +85,13 @@ export type playitTunnelAuth = {
   content: number[]
 }
 
+export type ping = {
+  tunnel_server_id: number,
+  tunnel_name: string,
+  ping: string
+  tunnel_addr: string|ReturnType<typeof parseIp>
+  client_addr: string|ReturnType<typeof parseIp>
+};
 
 /**
  * Create a key to asynchronously authenticate playit.gg clients
@@ -110,11 +129,17 @@ export declare interface playit {
 
   // User messages
   on(act: "message", fn: (data: string) => void): this;
+  once(act: "message", fn: (data: string) => void): this;
   emit(act: "message", data: string): boolean;
 
   // Ping
   on(act: "ping", fn: (ms: number) => void): this;
   emit(act: "ping", ms: number): boolean;
+
+  // Connection status
+  on(act: "status", fn: (status: "waitting"|"connected"|"disconnected") => void): this;
+  once(act: "status", fn: (status: "waitting"|"connected"|"disconnected") => void): this;
+  emit(act: "status", status: "waitting"|"connected"|"disconnected"): boolean;
 
   // Agent connect
   /** When the agent successfully authenticates, the agentConfig event will be emitted with the agent's information */
@@ -124,12 +149,16 @@ export declare interface playit {
   emit(act: "agentConfig", data: agentConfig): boolean;
 }
 
+function controlParse<jsonRes = {[key: string]: string}>(data: Buffer) {
+  return data.toString("utf8").split(/\r?\n/).map(line => line.trim().match(/^([a-z_0-9]+):\s(|[\s\S\W]+)$/)).map(data => {if (!data) return null; return {key: data[1], value: data[2]}}).reduce((mount, data) => {if (!data) return mount; mount[data.key] = data.value; return mount;}, {} as jsonRes);
+}
+
 /**
  * Create agent connection to playit
 */
 export class playit extends EventEmitter {
   // Agent status
-  public status: "conneted"|"waitting"|"disconnected" = "waitting";
+  public status: "waitting"|"connected"|"disconnected" = "waitting";
 
   // url APIs
   public apiUrl = "api.playit.cloud";
@@ -165,30 +194,34 @@ export class playit extends EventEmitter {
         } catch {}
         throw err;
       });
-
       if (!(accountInfo.status === "verified-account"||accountInfo.status === "guest-account"||accountInfo.status === "user-notice")) throw new Error("Verify account fist");
       else if (accountInfo.status === "guest-account") this.emit("message", "Using guest account");
       else if (accountInfo.status === "user-notice") this.emit("message", accountInfo.message);
 
       // Load agent config
       this.agentConfig = await httpRequest.getJSON<agentConfig>({url: agent, method: "POST", headers: {Authorization}, body: {type: "get-agent-config", client_version: options.clientVersion}});
+
+      // Tunnel auth
+      this.playitTunnelAuth = await httpRequest.getJSON<playitTunnelAuth>({url: agent, method: "POST", headers: {Authorization}, body: { type: "sign-tunnel-request", RegisterAgent: null }}).catch(err => Promise.reject(err.response?.body?.toString()||err));
+
+      // Send event to user
+      this.status = "connected";
+      this.emit("status", "connected");
       this.emit("agentConfig", this.agentConfig);
 
-      // ?
-      this.playitTunnelAuth = await httpRequest.getJSON<playitTunnelAuth>({url: agent, method: "POST", headers: {Authorization}, body: { type: "sign-tunnel-request", RegisterAgent: null }}).catch(err => Promise.reject(err.response?.body?.toString()||err));
-    })().catch(err => {
-      this.status = "disconnected";
-      return this.emit("error", err);
-    }).then(() => {
-      if (this.status !== "conneted") return;
+      // Ping
       (async() => {
         while (true) {
-          if (this.status !== "conneted") break;
-          const data = (await httpRequest.bufferFetch(format("http://%s/", this.agentConfig.ping_target_addresses[0]||"ping.playit.gg"))).data.toString("utf8").split(/\r?\n/).map(line => line.trim().match(/^([a-z_0-9]+):\s(|[\s\S\W]+)$/)).map(data => {if (!data) return null; return {key: data[1], value: data[2]}}).reduce((mount, data) => {if (!data) return mount; mount[data.key] = data.value; return mount;}, {} as {[key: string]: string});
+          if (this.status !== "connected") break;
+          const data = controlParse<ping>((await httpRequest.bufferFetch({url: format("http://%s/", this.agentConfig.ping_target_addresses[0]||"ping.playit.gg"), headers: {Authorization: this.#Authorization}})).data);
           this.emit("ping", parseInt(data.ping?.replace("ms", "")||"NaN"));
           await new Promise(done => setTimeout(done, 1200));
         }
       })();
+    })().catch(err => {
+      this.status = "disconnected";
+      this.emit("status", "disconnected")
+      return this.emit("error", err);
     });
   }
 
@@ -206,6 +239,7 @@ export class playit extends EventEmitter {
     data.tunnels = data.tunnels.filter(tunnel => (["minecraft-bedrock", "minecraft-java"]).includes(tunnel.tunnel_type));
     return data;
   }
+
   async createTunnel(options: {tunnelType?: tunnelType, name: string, portType: "tcp"|"udp"|"both", local: {ip?: string, port: number, count?: number}}) {
     const account = format("https://%s/account", this.apiUrl);
     const agent_id = (await this.listTunnels()).agent_id;
@@ -229,20 +263,39 @@ export class playit extends EventEmitter {
         local_port: options?.local?.port||null,
       }
     });
-    return (await this.listTunnels()).tunnels.find(tunnel => tunnel.id === tunnelCreated.id);
+    const tunnelInfo = (await this.listTunnels()).tunnels.find(tunnel => tunnel.id === tunnelCreated.id);
+    return {...tunnelInfo, connecttunnel: () => this.connectTunnel(tunnelInfo.id)};
   }
 
   async deleteTunnel(tunnelId: string) {
     if (!tunnelId) throw new Error("No tunnnel id");
+    if (!(await this.listTunnels()).tunnels.some(tunnel => tunnel.id === tunnelId)) throw new Error("tunnel no exist");
     const account = format("https://%s/account", this.apiUrl);
     await httpRequest.getJSON<{ type: "created", id: string }>({
       url: account,
       method: "POST",
       headers: {Authorization: this.#Authorization},
-      body: {
-        type: "delete-tunnel",
-        id: tunnelId
-      }
+      body: {type: "delete-tunnel", id: tunnelId}
     });
   }
+
+  async connectTunnel(tunnelId: string) {
+    if (!tunnelId) throw new Error("No tunnnel id");
+    const tunnelInfo = (await this.listTunnels()).tunnels.find(tunnel => tunnel.id === tunnelId);
+    if (!tunnelInfo) throw new Error("tunnel no exist");
+    // sign-agent-register
+    const agent = format("https://%s/agent", this.apiUrl);
+    const { control_address } = await httpRequest.getJSON<{control_address: string}>({url: agent, method: "POST", headers: {Authorization: this.#Authorization}, body: {type: "get-control-address"}});
+    const signData = await httpRequest.getJSON<{data: string}>({url: agent, method: "POST", headers: {Authorization: this.#Authorization}, body: {type: "sign-agent-register", agent_version: 1, client_addr: control_address, tunnel_addr: control_address}}).then(res => Buffer.from(res.data, "hex"));
+    const dataIP = parseIp(control_address);
+    const tunnel = dgram.createSocket(dataIP.type === "ipv4" ? "udp4":"udp6", (data, info) => {
+      console.log(data);
+      console.log(data.toString());
+      
+    });
+    tunnel.connect(dataIP.port, dataIP.ip);
+    return {signData, control_address, tunnel};
+  }
 };
+
+// export type test = {request_now: number, server_now: number, server_id: number, data_center_id: number, client_addr: string, tunnel_addr: string, session_expire_at: number};
